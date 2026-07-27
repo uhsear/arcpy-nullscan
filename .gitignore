@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Credentials. nullscan needs none, but nothing should ever land here by accident.
+.env
+*.env
+credentials*
+*token*
+
+# arcpy fixture leftovers
+*.gdb/
+*.aprx
+*.lock
+
+# The pre-rewrite script nullscan replaces. Internal work product, not ours
+# to publish. Kept locally for reference.
+legacy/
