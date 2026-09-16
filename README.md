@@ -153,3 +153,10 @@ Built by [Asir Khan](https://www.linkedin.com/in/asir-khan-310317264/).
 ## License
 
 MIT
+
+## Related
+
+Other single-file tools in this portfolio that pair with this one:
+
+- [geocodesift](https://github.com/uhsear/geocodesift) - the same question asked of a geocoded batch: the match rate is not the accuracy
+- [tzrot](https://github.com/uhsear/tzrot) - values that are never NULL and still wrong, because a date was read as UTC
