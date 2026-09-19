@@ -1,6 +1,6 @@
 # nullscan
 
-Report NULL and blank values across every layer and standalone table in an ArcGIS Pro map.
+Report NULL and blank values across every layer and standalone table in an ArcGIS Pro map, or in one feature class or table. With `--max-null-pct` it also refuses: a scan exits non-zero when a field you named is emptier than you allow.
 
 ```
 ================================================================
