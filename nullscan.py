@@ -538,6 +538,13 @@ def self_test():
     check(a.max_null_pct == [], "--max-null-pct is off by default")
     check(a.path is None, "the path is optional, for the Pro Python window")
     check(_parse(["--self-test"]).self_test, "--self-test parses")
+    try:
+        _parse(["d.gdb\\p", "--max-n", "A=1"])
+    except SystemExit:
+        check(True, "a unique prefix of --max-null-pct is refused  <-- pinned defect")
+    else:
+        check(False, "a unique prefix of --max-null-pct is refused  <-- pinned defect "
+              "(the parser accepted the abbreviation)")
     check(_parse(["x.aprx"]).path == "x.aprx", "a path is read positionally")
     check(_parse(["d.gdb\\p", "--max-null-pct", "A=1",
                   "--max-null-pct", "B=2"]).max_null_pct == ["A=1", "B=2"],
@@ -564,7 +571,7 @@ def self_test():
 
 def _parse(argv):
     ap = argparse.ArgumentParser(
-        prog="nullscan.py",
+        prog="nullscan.py", allow_abbrev=False,
         description="Report NULL and blank values in an ArcGIS Pro map, a "
                     "feature class or a table.",
         epilog="Without --max-null-pct nullscan only reports, and exits 0.")

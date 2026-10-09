@@ -138,7 +138,7 @@ Two approaches lost and were dropped. Per-field `IS NULL` pushdown took 1255 ms,
 "C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe" test_nullscan.py
 ```
 
-32 assertions against a fixture the test builds itself: a file geodatabase with nulls across text, numeric, date and geometry fields, a non-nullable text field holding blanks, a clean class, an empty class, a standalone table, a standalone table in its own geodatabase, a shapefile, a group layer, a nested table, a broken data source and a definition query.
+60 assertions against a fixture the test builds itself: a file geodatabase with nulls across text, numeric, date and geometry fields, a non-nullable text field holding blanks, a clean class, an empty class, a standalone table, a standalone table in its own geodatabase, a shapefile, a group layer, a nested table, a broken data source and a definition query.
 
 Two assertions pin the original script's bugs so they cannot come back quietly.
 
