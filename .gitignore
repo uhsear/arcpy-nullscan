@@ -19,3 +19,7 @@ credentials*
 # The pre-rewrite script nullscan replaces. Internal work product, not ours
 # to publish. Kept locally for reference.
 legacy/
+
+# Coverage data
+.coverage
+htmlcov/
