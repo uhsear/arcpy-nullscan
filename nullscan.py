@@ -2,8 +2,9 @@
 nullscan. Report NULL and blank values in every layer and standalone table of
 an ArcGIS Pro map, or in one feature class or table.
 
-Run it in the Pro Python window or a notebook (uses the open project), or
-standalone against a project file, or against a dataset path:
+Run it in the Pro Python window (uses the open project), or standalone against
+a project file, or against a dataset path. It reads sys.argv, so a notebook
+cell, where argv holds the kernel's own flags, must call main(["..."]) instead:
 
     python nullscan.py path\\to\\project.aprx
     python nullscan.py path\\to\\data.gdb\\parcels
@@ -39,6 +40,7 @@ Notes that change what you see:
 
 import argparse
 import os
+import struct
 import sys
 
 
@@ -91,6 +93,10 @@ NO_PLACEHOLDER = {"OID", "GlobalID"}
 # The three placeholder-tier counts a scan result carries, beside nulls/blanks.
 PLACEHOLDER_KINDS = ("placeholder", "nearmiss", "offdomain")
 
+# The largest finite 32-bit float. struct.pack("f") raises OverflowError past it
+# on some Python versions and returns infinity on others, so the test is explicit.
+FLOAT32_MAX = 3.4028234663852886e38
+
 # Width of the field-name column in the report. Geodatabase field names can
 # reach 64 characters; widen this if yours wrap.
 NAME_WIDTH = 28
@@ -138,7 +144,7 @@ def parse_limits(pairs, flag="--max-null-pct"):
             raise ValueError("%s %s: %r is not a number" % (flag, name, raw))
         if not 0.0 <= pct <= 100.0:
             raise ValueError("%s %s: %s is not a percentage" % (flag, name, raw))
-        if name in limits:
+        if name.lower() in set(k.lower() for k in limits):
             raise ValueError("%s names %s twice" % (flag, name))
         limits[name] = pct / 100.0
     return limits
@@ -189,13 +195,24 @@ def _value_text(value):
     return value
 
 
-def match_token(value, tokens):
+def _single(number):
+    """number rounded to the nearest 32-bit float, or None when it does not
+    fit. arcpy hands a Single field back as the float32 widened to a Python
+    float, so -9999.9 reads back as -9999.900390625."""
+    if abs(number) > FLOAT32_MAX:
+        return None
+    return struct.unpack("f", struct.pack("f", number))[0]
+
+
+def match_token(value, tokens, single=False):
     """The declared token that value equals, or None.
 
     Text compares stripped and without case, so "n/a " matches N/A. A number
     matches a token that parses to the same number, so 99999 and 99999.0 both
-    match "99999" while "99999" typed into a text field matches too. Booleans
-    and anything else never match."""
+    match "99999" while "99999" typed into a text field matches too. In a
+    Single (32-bit float) field the token is rounded to float32 first, or a
+    decimal sentinel such as -9999.9 could never match. Booleans and anything
+    else never match."""
     value = _value_text(value)
     if isinstance(value, str):
         text = value.strip().casefold()
@@ -205,10 +222,13 @@ def match_token(value, tokens):
     elif isinstance(value, (int, float)) and not isinstance(value, bool):
         for token in tokens:
             try:
-                if float(token) == value:
-                    return token
+                number = float(token)
             except ValueError:
-                pass
+                continue
+            if single:
+                number = _single(number)
+            if number == value:
+                return token
     return None
 
 
@@ -234,7 +254,7 @@ def build_domain(codes):
     return set(codes), nearby
 
 
-def classify_value(value, tokens, domain, check_domains):
+def classify_value(value, tokens, domain, check_domains, single=False):
     """Decide one present value. Returns (kind, example), kind one of "" (a
     real value), "placeholder", "nearmiss", "offdomain". Pure.
 
@@ -252,7 +272,7 @@ def classify_value(value, tokens, domain, check_domains):
             code = nearby.get(domain_key(value))
             if code is not None:
                 return "nearmiss", "near-miss %s ~ %s" % (ascii(value), ascii(code))
-    token = match_token(value, tokens)
+    token = match_token(value, tokens, single)
     if token is not None:
         return "placeholder", "placeholder %s" % token
     if domain is not None and check_domains:
@@ -284,24 +304,32 @@ def judge(res, limits):
         return ["REFUSED: %s could not be read (%s), so no limit was checked"
                 % (res.get("label") or "the source", res["error"])]
 
-    present = set(res.get("fields") or ())
-    unscanned = set(res.get("unscanned") or ())
+    present = dict((f.lower(), f) for f in res.get("fields") or ())
+    # Fields whose NULLs the scan never saw: Blob, Raster and a rejected
+    # geometry query ("unscanned"), and NOT NULL fields that are not text
+    # ("nullblind"). A limit on one of them could never report red.
+    blind = set(f.lower() for f in
+                list(res.get("unscanned") or ()) + list(res.get("nullblind") or ()))
+    nulls = _ci(res.get("nulls"))
+    blanks = _ci(res.get("blanks"))
     rows = res.get("rows", 0)
     reasons = []
     for name in sorted(limits):
-        if name not in present:
+        key = name.lower()
+        if key not in present:
             reasons.append(
                 "REFUSED: field %s is not in this dataset, so its limit could "
                 "not be checked. Fields present: %s"
-                % (name, ", ".join(sorted(present)) or "none"))
+                % (name, ", ".join(sorted(present.values())) or "none"))
             continue
-        if name in unscanned:
+        if key in blind:
             reasons.append(
-                "REFUSED: field %s holds a type nullscan never reads, so its "
-                "limit could never report red" % name)
+                "REFUSED: field %s was never read for NULLs (a Blob, Raster or "
+                "Geometry column, or a NOT NULL field that is not text), so "
+                "its limit could never report red" % name)
             continue
-        fraction = null_fraction(
-            res["nulls"].get(name, 0) + res["blanks"].get(name, 0), rows)
+        affected = nulls.get(key, 0) + blanks.get(key, 0)
+        fraction = null_fraction(affected, rows)
         if fraction is None:
             reasons.append(
                 "REFUSED: the dataset holds no rows, so the limit on %s is "
@@ -311,9 +339,7 @@ def judge(res, limits):
             reasons.append(
                 "REFUSED: %s is %.1f%% NULL or blank (%d of %d rows), limit "
                 "is %.1f%%"
-                % (name, fraction * 100,
-                   res["nulls"].get(name, 0) + res["blanks"].get(name, 0),
-                   rows, limits[name] * 100))
+                % (name, fraction * 100, affected, rows, limits[name] * 100))
     return reasons
 
 
@@ -378,6 +404,9 @@ def render(res):
     lines = ["\n%s  (%d rows)" % (res["label"], res["rows"])]
     if res["note"]:
         lines.append("    ~ %s" % res["note"])
+    if res.get("unscanned"):
+        lines.append("    ~ NULLs not checked in %s (Blob, Raster or Geometry)"
+                     % ", ".join(res["unscanned"]))
     # res.get: a result built before the placeholder tier has none of these.
     counted = [("null", res["nulls"]), ("blank", res["blanks"]),
                ("placeholder", res.get("placeholder") or {}),
@@ -443,7 +472,8 @@ def scan(source, label, arcpy=None, tokens=None, check_domains=False):
     arcpy = arcpy or _import_arcpy()
     tokens = tokens or {}
     out = {"label": label, "rows": 0, "nulls": {}, "blanks": {},
-           "fields": [], "unscanned": [], "note": "", "error": "",
+           "fields": [], "unscanned": [], "nullblind": [], "note": "",
+           "error": "",
            "placeholder": {}, "nearmiss": {}, "offdomain": {},
            "examples": {}, "examined": []}
 
@@ -500,7 +530,8 @@ def scan(source, label, arcpy=None, tokens=None, check_domains=False):
         if wild or named or coded:
             plan[f.name] = (named + wild,
                             build_domain(domains[f.name]) if f.name in domains
-                            else None)
+                            else None,
+                            f.type == "Single")
 
     # Text fields are scanned even when non-nullable: a NOT NULL text column
     # cannot hold NULL but very much can hold '' or '   ', and on shapefiles
@@ -539,6 +570,12 @@ def scan(source, label, arcpy=None, tokens=None, check_domains=False):
     checked = set(names) | ({shape_field} if geom_checked else set())
     out["unscanned"] = [f.name for f in fields
                         if f.type in UNSCANNABLE and f.name not in checked]
+    # A NOT NULL field that is not text is read only for placeholders, never
+    # for NULLs: it cannot hold one, and a shapefile stores a missing number as
+    # 0. A --max-null-pct on it would report within bounds forever.
+    out["nullblind"] = [f.name for f in fields if f.type not in UNSCANNABLE
+                        and not (f.isNullable
+                                 or (REPORT_BLANKS and f.type == "String"))]
 
     if not names:                                 # nothing scannable; still count rows
         try:
@@ -565,8 +602,9 @@ def scan(source, label, arcpy=None, tokens=None, check_domains=False):
                     elif name in text and not value.strip():
                         blanks[name] += 1
                     elif name in plan:
+                        declared, domain, single = plan[name]
                         kind, example = classify_value(
-                            value, plan[name][0], plan[name][1], check_domains)
+                            value, declared, domain, check_domains, single)
                         if kind:
                             found[kind][name] += 1
                             shown = out["examples"].setdefault(name, [])
@@ -628,10 +666,15 @@ def scan_project(aprx_path, tokens=None, check_domains=False, arcpy=None):
 
     flagged = 0
     pflagged = 0
+    unread = 0
+    seen = set()
     for m in maps:
         report("\n%s\nMap: %s\n%s" % ("=" * 64, m.name, "=" * 64), arcpy)
         for source, label in collect(m):
             res = scan(source, label, arcpy, tokens, check_domains)
+            seen.update(res["fields"])
+            if res["error"]:
+                unread += 1
             if res["nulls"] or res["blanks"]:
                 flagged += 1
             if any(res[kind] for kind in PLACEHOLDER_KINDS):
@@ -643,6 +686,14 @@ def scan_project(aprx_path, tokens=None, check_domains=False, arcpy=None):
     if tokens or check_domains:
         report("%d layer(s) or table(s) with placeholder, near-miss or "
                "off-domain values." % pflagged, arcpy)
+    for name in unknown_declared(tokens or {}, seen):
+        report("~ --placeholder names %s, which no scanned layer or table has. "
+               "A joined field is listed under a qualified name such as "
+               "table.FIELD." % name, arcpy)
+    if unread:
+        report("! %d layer(s) or table(s) could not be read, so this report is "
+               "incomplete. Exit code 4." % unread, arcpy)
+        return 4
     return 0
 
 
@@ -664,6 +715,13 @@ def scan_dataset(path, limits, plimits=None, tokens=None, check_domains=False,
                "have" % name, arcpy)
 
     reasons = judge(res, limits) + judge_placeholders(res, plimits)
+    if res["error"]:
+        # Exit 4, not 0 and not 3: the tool could not read the source, which is
+        # neither a clean run nor a broken limit.
+        for reason in reasons or ["! the source could not be read, so nothing "
+                                  "was checked. Exit code 4."]:
+            report(reason, arcpy)
+        return 4
     if not limits and not plimits:
         return 0
     report("", arcpy)
@@ -1344,8 +1402,8 @@ def self_test():
 
     # ---- collect() and scan_project()
     lyr = _Src("t.gdb/parcels", "Parcels", isFeatureLayer=True)
-    grp = _Src("grp", "Group", isGroupLayer=True)
-    base = _Src("base", "Base", isBasemapLayer=True)
+    grp = _Src("grp", "Group", isGroupLayer=True, isFeatureLayer=True)
+    base = _Src("base", "Base", isBasemapLayer=True, isFeatureLayer=True)
     ras = _Src("ras", "Raster", isFeatureLayer=False)
     brk = _Src("gone", "Gone", isFeatureLayer=False, isBroken=True)
     tbl = _Src("blob", "Permits", strict=True)
@@ -1357,8 +1415,13 @@ def self_test():
     ex.data["gone"] = _Data([])
     ex.data["blob"] = _Data([_Field("PHOTO", "Blob")], [(None,)])
     ex.projects["qa.aprx"] = _Aprx([m], active=m)
-    check(scan_project("qa.aprx", None, False, ex) == 0, "a project scan exits 0")
+    check(scan_project("qa.aprx", None, False, ex) == 4,
+          "a project with an unreadable layer exits 4, not 0  <-- pinned defect")
     text_out = "\n".join(ex.messages)
+    check("! 1 layer(s) or table(s) could not be read" in text_out,
+          "the project footer counts the sources it could not read")
+    check("Base" not in text_out and "Group" not in text_out,
+          "a basemap or group layer is never scanned, even one that looks like data")
     check("Map: QA" in text_out and "Parcels  (10 rows)" in text_out
           and "Permits (table)  (1 rows)" in text_out and "! data source is broken" in text_out,
           "a project scan reports each map, layer, table and unreadable source")
@@ -1400,7 +1463,8 @@ def self_test():
           and "Not a project" in ex.messages[-1], "a path that does not exist exits 2")
     ex.messages[:] = []
     check(scan_dataset("t.gdb/parcels", {}, arcpy=ex) == 0
-          and "parcels  (10 rows)" in ex.messages[0], "a plain dataset scan exits 0")
+          and "parcels  (10 rows)" in ex.messages[0] and ex.messages[-1] != "",
+          "a plain dataset scan exits 0 and prints no verdict")
     ex.messages[:] = []
     scan_dataset("/", {}, arcpy=ex)
     check("\n/  (10 rows)" in ex.messages, "a bare slash path is labelled by the path")
@@ -1433,6 +1497,132 @@ def self_test():
     scan_dataset("t.gdb/parcels", {}, {}, parse_tokens(["ghost=1", "*=1"]), False, ex)
     check("    ~ --placeholder names ghost, which this dataset does not have"
           in ex.messages, "a declared field the dataset lacks is named in the report")
+
+    # ---- a Single field returns a float32 widened to a double
+    f32 = struct.unpack("f", struct.pack("f", -9999.9))[0]
+    check(f32 != -9999.9 and match_token(f32, ["-9999.9"], True) == "-9999.9",
+          "a decimal token matches the float32 a Single field returns  <-- pinned defect")
+    check(match_token(f32, ["-9999.9"]) is None,
+          "without the Single flag a decimal token compares as an exact double")
+    check(match_token(99999.0, ["99999"], True) == "99999",
+          "an integer token still matches in a Single field")
+    check(match_token(1.5, ["1e300", "1.5"], True) == "1.5",
+          "a token too large for float32 never matches and does not stop the next")
+    check(match_token(float("inf"), ["1e300"], True) is None,
+          "a token too large for float32 does not round to the infinity a field holds")
+    fa = _FakeArcpy({
+        "flt": _Data([_Field("FLT", "Single"), _Field("DBL", "Double")],
+                     [(f32, f32), (1.5, 1.5), (f32, None)])})
+    flt = parse_tokens(["*=-9999.9"])
+    res = scan("flt", "flt", fa, flt)
+    check(res["placeholder"] == {"FLT": 2},
+          "a Single field counts its float32 sentinel, a Double field does not  "
+          "<-- pinned defect")
+    check(scan_dataset("flt", {}, {"FLT": 0.0}, flt, False, fa) == 3,
+          "a placeholder limit on a Single field refuses on its sentinel  "
+          "<-- pinned defect")
+
+    # ---- --max-null-pct finds a field whatever the case it was typed in
+    check(judge(result(fields=["NOTE"]), {"note": 0.5}) == [],
+          "a null limit typed in another case finds its field  <-- pinned defect")
+    r = judge(result(fields=["NOTE"], nulls={"NOTE": 50}), {"note": 0.1})
+    check(len(r) == 1 and "50.0%" in r[0],
+          "a null limit typed in another case still counts that field's NULLs")
+    check("Fields present: NOTE" in judge(result(fields=["NOTE"]), {"x": 0.1})[0],
+          "the fields present are listed as the dataset spells them")
+    raises(lambda: parse_limits(["note=1", "NOTE=2"]),
+           "the same field limited twice, ignoring case, raises")
+
+    # ---- a null limit on a field the scan never read for NULLs must refuse
+    r = judge(result(fields=["N"], nullblind=["N"]), {"n": 0.1})
+    check(len(r) == 1 and "never read" in r[0],
+          "a null limit on a NOT NULL non-text field REFUSES  <-- pinned defect")
+    fa = _FakeArcpy({
+        "nn": _Data([_Field("OBJECTID", "OID", False),
+                     _Field("N", "Integer", False), _Field("T", "String", False),
+                     _Field("D", "Double")],
+                    [(1, 0, "x", 1.0), (2, 0, "  ", 2.0), (3, 0, "", None)])})
+    res = scan("nn", "nn", fa)
+    check(res["nullblind"] == ["OBJECTID", "N"],
+          "a NOT NULL field that is not text is reported as blind to NULLs")
+    check(res["blanks"] == {"T": 2} and res["nulls"] == {"D": 1},
+          "a NOT NULL text column is scanned for blanks, which is the shapefile signal")
+    check(scan_dataset("nn", {"N": 0.0}, arcpy=fa) == 3
+          and "never read" in fa.messages[-1],
+          "main-level: a null limit on a NOT NULL integer exits 3, not within bounds")
+    fa.messages[:] = []
+    check(scan_dataset("nn", {"T": 0.1}, arcpy=fa) == 3
+          and "T is 66.7% NULL or blank" in fa.messages[-1],
+          "a null limit on a NOT NULL text column judges its blanks")
+
+    # ---- a field with a domain is not examined unless something asks for it
+    res = scan("t.gdb/parcels", "parcels", world(), parse_tokens(["parcel=N/A"]))
+    check(res["examined"] == ["PARCEL"],
+          "a coded-domain field is not examined without --check-domains or a token")
+    fa = world()
+    check(scan_dataset("t.gdb/parcels", {}, {"STATUS": 0.9}, parse_tokens(["parcel=N/A"]),
+                       False, fa) == 3
+          and "never examined" in fa.messages[-1],
+          "a placeholder limit on a domain field nobody examined refuses")
+
+    # ---- the same token declared for one field in two cases
+    raises(lambda: parse_tokens(["status=1", "STATUS=2"]),
+           "the same field declared twice, lower case first, raises")
+
+    # ---- the report says which fields it could not read for NULLs
+    lines = render(result(fields=["PHOTO"], unscanned=["PHOTO"]))
+    check("    ~ NULLs not checked in PHOTO (Blob, Raster or Geometry)" in lines
+          and lines[-1] == "    clean",
+          "a clean report names the Blob column it did not read  <-- pinned defect")
+    lines = render(presult(nulls={"PARCEL": 3}))
+    check(lines[1] == "    " + "PARCEL".ljust(28) + "      3 null  (3.0%)",
+          "the field name column is 28 wide and the counts follow it")
+
+    # ---- a source that cannot be read is exit 4, never a clean 0
+    fa = _FakeArcpy({"bad": _Data([_Field("N")], [(1,)], cursor_error="row read failed"),
+                     "none": _Data([])})
+    check(scan_dataset("bad", {}, arcpy=fa) == 4
+          and fa.messages[-1].startswith("! the source could not be read"),
+          "an unreadable dataset with no limit exits 4, not 0  <-- pinned defect")
+    fa.messages[:] = []
+    check(scan_dataset("bad", {"N": 0.5}, arcpy=fa) == 4
+          and fa.messages[-1].startswith("REFUSED: bad could not be read"),
+          "an unreadable dataset with a limit exits 4, not the 3 of a broken limit")
+    check(scan_dataset("none", {}, arcpy=fa) == 4,
+          "a dataset with no readable fields exits 4")
+    check(main(["bad"], fa) == 4, "main() hands the exit 4 on")
+
+    # ---- project summaries count every kind of finding
+    fa = _FakeArcpy({
+        "bo": _Data([_Field("T", "String", False)], [("x",), ("  ",)]),
+        "nm": _Data([_Field("STATUS", domain="StatusDom")], [("A ",)]),
+        "od": _Data([_Field("STATUS", domain="StatusDom")], [("Z",)]),
+        "ok": _Data([_Field("STATUS", domain="StatusDom")], [("A",)]),
+        "jn": _Data([_Field("permits.STATUS", domain="StatusDom")], [("A",)])}, domains)
+    sources = [_Src(n, n, isFeatureLayer=True) for n in ("bo", "nm", "od", "ok", "jn")]
+    fa.projects["s.aprx"] = _Aprx([_Map("S", sources)], active=None)
+    check(scan_project("s.aprx", None, True, fa) == 0, "a project that all reads exits 0")
+    text_out = "\n".join(fa.messages)
+    check("\n1 layer(s) or table(s) with NULL or blank values." in text_out,
+          "a layer with blanks and no NULLs is counted in the summary  "
+          "<-- pinned defect")
+    check("\n2 layer(s) or table(s) with placeholder, near-miss or off-domain values."
+          in text_out,
+          "a near-miss-only and an off-domain-only layer are both counted  "
+          "<-- pinned defect")
+    check("~ --placeholder" not in text_out, "no declaration means no unknown-field note")
+    fa.messages[:] = []
+    scan_project("s.aprx", parse_tokens(["t=x", "STATSU=1", "status=1", "*=2"]), False, fa)
+    notes = [line for line in fa.messages if line.startswith("~ --placeholder")]
+    check(len(notes) == 1 and notes[0].startswith(
+          "~ --placeholder names statsu, which no scanned layer or table has"),
+          "a declared field that no layer in the project has is named  "
+          "<-- pinned defect")
+    fa.messages[:] = []
+    scan_project("s.aprx", parse_tokens(["permits.status=1"]), False, fa)
+    check(not [line for line in fa.messages if line.startswith("~ --placeholder")],
+          "a joined field is found under its qualified name")
+
 
     # ---- reaching arcpy
     fake_module = types.ModuleType("arcpy")
@@ -1531,7 +1721,8 @@ def _parse(argv):
         prog="nullscan.py", allow_abbrev=False,
         description="Report NULL, blank and placeholder values in an ArcGIS Pro "
                     "map, a feature class or a table.",
-        epilog="Without a --max-*-pct flag nullscan only reports, and exits 0. "
+        epilog="Without a --max-*-pct flag nullscan only reports, and exits 0 "
+               "unless a source could not be read (exit 4). "
                "nullscan never writes to the data it reads.")
     ap.add_argument("path", nargs="?",
                     help="a .aprx project, or a feature class or table path. "

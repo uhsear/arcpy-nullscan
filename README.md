@@ -32,8 +32,8 @@ permits (table)  (9877 rows)
 ## What already exists
 
 - Attribute domains in the geodatabase. They stop a bad value on entry. The Esri overview page quoted above does not say that stored rows are checked against a domain. In the test geodatabase built for this repo, `arcpy.da.InsertCursor` wrote `'Z'` and `'A '` into a text field bound to a coded domain without an error. Domains are the right control for editing, and nullscan only reads them.
-- ArcGIS Data Reviewer. Esri describes it as validating "data using different checks that test spatial relationships and integrity". It is the heavier tool, for a rule set that a team maintains. nullscan is one file for one question.
-- A search of GitHub (`gh search repos`) for "arcpy domain", "arcpy nullscan" and "arcgis domain violations" found no repository that scans for declared placeholder tokens beside coded domains. The closest result, `madhurdevkota/arcgis-data-integrity-workflow`, describes itself as scripting for schema, subtypes, domains and validation. By its description it builds domains, and I have not run it.
+- ArcGIS Data Reviewer. Its [checks overview](https://doc.esri.com/en/arcgis-pro/latest/help/data/validating-data/an-overview-of-data-reviewer-checks-in-arcgis-pro.html) lists a Domain check that "Finds attribute values that do not comply with the coded value or range domains that are associated with an attribute field". That is the off-domain part of nullscan, done well, with a rule set a team maintains. It also lists Query Attributes ("Finds records based on a `WHERE` clause run against row attributes") and Regular Expression checks, and a WHERE clause can express `STATUS = 99999`. What nullscan adds is smaller: tokens declared on the command line, a near-miss report that separates `'A '` from a truly foreign value, the exclusion of a `99999` that is a real code, and a non-zero exit for a nightly job. It is one file, with no rule set to maintain. I did not run Data Reviewer for this repo.
+- A search of GitHub (`gh search repos`) on 2026-10-30 for "arcpy domain", "arcpy domains", "arcpy placeholder values", "arcpy sentinel values", "arcgis domain violations" and "arcgis null scan" returned nothing. "arcgis data integrity" returned `madhurdevkota/arcgis-data-integrity-workflow`, which describes itself as scripting for schema, subtypes, domains and validation, and `monicaburagadda/data-validation-toolbox`, a toolbox that exports tables and audits them with Pandas. By their descriptions neither scans for declared placeholder tokens beside coded domains, and I have not run either.
 
 ## Usage
 
@@ -68,7 +68,11 @@ nullscan.py C:\data\city.gdb\permits --placeholder "*=99999,N/A" --check-domains
 | `--max-placeholder-pct FIELD=PCT` | Exit 3 when more than PCT percent of FIELD is a declared placeholder, a near-miss or off-domain. Needs `--placeholder` or `--check-domains`. Dataset path only. |
 | `--self-test` | Run the offline assertions and exit. |
 
-Exit codes: `0` ran, `1` project has no maps, `2` no project found, `3` a limit was exceeded, `64` bad arguments. The argument parser also exits `2` on an unknown flag.
+Exit codes: `0` ran and read every source, `1` project has no maps, `2` no project or dataset found, `3` a limit was exceeded, `4` a layer, table or dataset could not be read, `64` bad arguments. Exit `4` is distinct from `3` on purpose: a nightly job that cannot read its input has not found clean data. The report still lists every `!` line, and the project footer counts them.
+
+Some codes are shared. The argument parser exits `2` on an unknown flag. An uncaught error and a missing arcpy both exit `1`. A zero-byte `.aprx` prints the "No open project" text and exits `2`, which hides the real cause.
+
+In a notebook, `sys.argv` holds the kernel's own flags (`-f kernel.json`), so running the file there ends in `unrecognized arguments: -f` and exit `2`. Import the file and pass the arguments yourself instead: `import nullscan; nullscan.main([r"C:\data\city.gdb\permits", "--max-null-pct", "ISSUED_DT=5"])`.
 
 nullscan never writes to the data it reads. It has no `--apply`, because there is nothing to apply. Every parser sets `allow_abbrev=False`, so a prefix such as `--placeh` is refused instead of being read as a flag. The self-test pins this.
 
@@ -78,12 +82,12 @@ Four kinds of value are counted, each with up to three examples:
 
 | Column | What it is | Needs |
 |---|---|---|
-| `placeholder` | A value equal to a declared token. Text compares without case and without padding. A number matches a token with the same numeric value, so `99999.0` matches `99999`. A midnight date matches `1900-01-01`. | `--placeholder` |
+| `placeholder` | A value equal to a declared token. Text compares without case and without padding. A number matches a token with the same numeric value, so `99999.0` matches `99999`. In a Single (32-bit float) field the token is rounded to float32 first, because arcpy returns `-9999.9` there as `-9999.900390625`. A midnight date matches `1900-01-01`. | `--placeholder` |
 | `near-miss` | Not a domain code, but one once spacing, case and leading zeros are ignored. `'A '` and `'a'` beside the code `'A'`, or `'007'` beside `'7'`. | `--check-domains` |
 | `off-domain` | Present, not a code, not a near-miss and not a declared token. | `--check-domains` |
 | coded-domain exclusion | A value that is exactly a code of the field's coded value domain is real and never flagged, even when it equals a declared token. A domain that deliberately holds `99999` for "unknown" stays clean. | any of the above |
 
-Each value is judged once, in this order: NULL, blank, exact domain code, near-miss, declared token, off-domain. The order has one consequence worth knowing. With the code `99999` in the domain, the value `'99999 '` is reported as a near-miss, not as a placeholder, because it is a misspelled code.
+Each value is judged once, in this order: NULL, blank, exact domain code, near-miss, declared token, off-domain. The order has one consequence worth knowing. With the code `99999` in the domain and `--check-domains` on, the value `'99999 '` is reported as a near-miss, not as a placeholder, because it is a misspelled code. With `--placeholder` alone the near-miss step is skipped, so the same value is reported as a placeholder.
 
 A real run on a file geodatabase built for this test (eight rows, a coded domain on `STATUS` and on `ZONE`, a range domain on `SQFT`):
 
@@ -103,9 +107,9 @@ permits  (8 rows)
 
 `STATUS` holds a real `99999` code and `ZONE` a real `29999` code. Both are in the domain, so neither is flagged. `SQFT` has only a range domain, which has no codes, so its `99999.0` is flagged.
 
-Field names are matched without regard to case here. A `--placeholder` or limit that names no field in the dataset is reported, never ignored: `--placeholder` prints a note, and `--max-placeholder-pct` refuses.
+Field names are matched without regard to case in `--placeholder`, `--max-null-pct` and `--max-placeholder-pct`. A `--placeholder` or limit that names no field is reported, never ignored: `--placeholder` prints a note, in a dataset scan and in a project scan, and the limits refuse. In a project scan the note appears when no scanned layer or table has the field. A joined layer lists its fields under qualified names, so `--placeholder lookup.STATUS=99999` reaches a joined field and `STATUS=99999` does not.
 
-`--max-placeholder-pct` refuses a field that was never examined, which means no token names it and no coded domain was read. Such a limit could never report red, so nullscan will not let it pass.
+`--max-placeholder-pct` refuses a field that was never examined, which means no token names it and no coded domain was read. Such a limit could never report red, so nullscan will not let it pass. `--max-null-pct` does the same for a field whose NULLs were never read: a Blob, Raster or Geometry column, or a `NOT NULL` field that is not text.
 
 ## Reading the output
 
@@ -115,9 +119,11 @@ Field names are matched without regard to case here. A `--placeholder` or limit 
 
 `~ filtered` means the layer has a definition query or an active selection. Cursors honour both, so only visible rows were scanned.
 
-`~ coded domains not read (...)` means the geodatabase refused the domain lookup. The scan carries on, but the coded-domain exclusion is lost, so a real `99999` code is then flagged as a placeholder. The note says so, and a failed read is never silent.
+`~ NULLs not checked in PHOTO (Blob, Raster or Geometry)` names the columns whose NULLs the scan did not read. A table whose only unread column is a Blob still reads `clean` for the rest.
 
-`! ...` means that layer or table could not be read, usually a broken or moved source. Basemaps and group layers are left out of the report entirely, never scanned and never flagged.
+`~ coded domains not read (...)` means the geodatabase refused the domain lookup. The scan carries on. The note reports only that the domains were not read. The exclusion is lost, so a real `99999` code is flagged as a placeholder. That can cause a false refusal and never a false pass.
+
+`! ...` means that layer or table could not be read, usually a broken or moved source. The run then exits `4`. Basemaps and group layers are left out of the report entirely, never scanned and never flagged.
 
 ## Configuration
 
@@ -202,9 +208,29 @@ Two approaches lost and were dropped. Per-field `IS NULL` pushdown took 1255 ms,
 
 **No enterprise geodatabase testing.** Everything here ran against file geodatabases and shapefiles. On SDE the per-field `IS NULL` pushdown that lost above may win. Re-measure before trusting these numbers on versioned enterprise data. The domain lookup was also only run against a file geodatabase.
 
-**Subtype domains are not read.** The field-level domain is. Esri's domain overview says features grouped into subtypes can each have a different domain, and nullscan does not look at subtypes. A field whose domain differs per subtype is judged against its default domain only.
+**Subtype domains are not read.** The field-level domain is. Esri's domain overview says features grouped into subtypes can each have a different domain, and nullscan does not look at subtypes. A field whose domain differs per subtype is judged against its default domain only. A field that has no field-level domain gets no coded-domain exclusion, so a real `99999` code held only by a subtype domain is flagged as a placeholder.
 
-**Project mode with the placeholder tier ran only against a stand-in arcpy.** The dataset path ran against a real file geodatabase: a table, and a feature class inside a feature dataset. No saved `.aprx` was built for this test.
+**Project mode ran for real on one small project.** A saved `.aprx` holding a table, a standalone table and a layer with a join was scanned with the placeholder tier. A copy with its geodatabase moved exited `4` and listed three `!` sources. The project came from a throwaway script that is not in this repo.
+
+**Exit `0` is not proof of a clean source in two cases.** A `--placeholder` whose token can never match the field's type finds nothing: `N/A` declared for a number, or `1/1/1900` for a date (declare a date as `1900-01-01`). A matching `--max-placeholder-pct` then passes. And `--check-domains` on a source with no coded domain, such as a shapefile, a Range-only field or a domain name that `ListDomains` did not return, prints `clean` with no note. Only `--max-placeholder-pct` turns that into a refusal.
+
+**A passing placeholder verdict says nothing about what it did not look for.** `VERDICT: within every --max-placeholder-pct limit.` does not say whether near-misses and off-domain values were examined. Without `--check-domains`, a trailing-space `'A '` passes the gate unseen.
+
+**A decimal limit can refuse at its exact boundary.** The comparison is `pct / 100.0` against `affected / rows` in floating point. With 7 NULLs in 250 rows, `--max-null-pct F=2.8` prints `F is 2.8% ... limit is 2.8%` and exits `3`. Over every whole-number limit from 0 to 100 and every row count up to 150, the float comparison and the exact integer comparison agreed in 1,158,975 cases. With limits of one decimal place they disagreed in 13 of 11,486,475 cases.
+
+**Token parsing is loose.** A token goes through Python's `float()`, so `99_999` is read as 99999. An integer above 2**53 is compared as a float and can miss. A text field holding `'099999'` does not match the token `99999`. A token that holds a comma cannot be declared, because `--placeholder` splits on commas. A decimal token is rounded to float32 for a Single field and compared exactly for a Double field.
+
+**The near-miss key ignores only case and the whitespace that `str.split()` knows.** A zero-width space after a code is not ignored, so `'A'` plus U+200B is off-domain, not a near-miss. A non-breaking space is ignored.
+
+**A layer with a join rejects the geometry `IS NULL` query.** The report says `geometry NULLs not checked (source rejected IS NULL)`, and the geometry column is listed as not checked. Its fields have qualified names, such as `lookup.STATUS`. Both were seen on a real project.
+
+**Scanning a project reads every feature layer in it, web layers included, with the account that Pro is signed in to.** This was not run against a web layer.
+
+**arcpy error text is printed as it comes.** A report line such as `! OSError: "<path>" does not exist` can carry a path, and an enterprise connection error can carry a server or account name. Read a report before you paste it into a ticket.
+
+**A dataset path that `ListFields` rejects reports an `AttributeError`, not the arcpy error.** `scan()` retries with `source.dataSource`, which a plain path string does not have. The self-test pins this message. `scan_dataset()` checks `arcpy.Exists` first, so it needs a path that exists and cannot be listed.
+
+**Path labels are cosmetic on Linux.** The label is the part after the last path separator. A backslash path on Linux keeps its whole text as the label (`a\b` stays `a\b`). Linux has no arcpy, so only the self-test meets this.
 
 **Range domains are skipped.** A range domain has no codes to compare with, so only a declared token can flag a value in such a field.
 
@@ -237,19 +263,28 @@ PASS  a code that is also a token stays excluded with --check-domains
 PASS  99999 with no domain is a placeholder  <-- pinned defect
 PASS  99999 with a trailing space beside a 99999 code is a near-miss, not a placeholder  <-- pinned defect
 ...
+PASS  a project with an unreadable layer exits 4, not 0  <-- pinned defect
+...
+PASS  a decimal token matches the float32 a Single field returns  <-- pinned defect
+PASS  a null limit typed in another case finds its field  <-- pinned defect
+PASS  a null limit on a NOT NULL non-text field REFUSES  <-- pinned defect
+PASS  a clean report names the Blob column it did not read  <-- pinned defect
+...
 PASS  a unique prefix --placeh is refused  <-- pinned defect
 PASS  a unique prefix --check-d is refused  <-- pinned defect
 PASS  a unique prefix --max-placeholder is refused  <-- pinned defect
 ...
 --------------------------------------------------------------------
-205 assertions, 0 failed
+238 assertions, 0 failed
 ```
 
 The count is the same on Windows Python 3.13 (`C:\Python313`, and the Pro 3.6 environment with arcpy installed) and on Linux Python 3.12, which has no arcpy. The tests never import the real arcpy, so no assertion depends on it.
 
 Branch coverage is 100%, measured with `coverage run --branch nullscan.py --self-test`.
 
-Two checks guard the tests themselves. The harness is run a second time on assertions built to fail, which proves that a failure is printed and returns 1. Ten deliberate breaks of the code, such as removing the domain exclusion or letting the parser accept an abbreviation, were each caught by the self-test.
+Two checks guard the tests themselves. The harness is run a second time on assertions built to fail, which proves that a failure is printed and returns 1. A throwaway script then applied 76 one-line breaks of the code, such as removing the domain exclusion, comparing field names with case, or letting the parser accept an abbreviation, and the self-test failed on each one. That script is not in this repo, so the figure is a claim about one run on 2026-10-30. The first run of such a sweep left six breaks alive, and each now has a pinned assertion.
+
+The real-geodatabase block above and the figures in "Where the behaviour was checked" came from throwaway scripts that built synthetic data. They are not in this repo, so the block is not regenerated here.
 
 ## Where the behaviour was checked
 
@@ -260,7 +295,7 @@ Esri documentation, read on 2026-10-22:
 - [Dataset properties](https://doc.esri.com/en/arcgis-pro/latest/arcpy/functions/dataset-properties.html): `workspace` "Returns a `Describe` object with the properties of the input dataset's workspace." The [Describe object page](https://doc.esri.com/en/arcgis-pro/latest/arcpy/functions/describe-object-properties.html) gives `catalogPath` as "The path of the data." nullscan reads `Describe(path).workspace.catalogPath`, and a real run confirmed that it reaches the geodatabase from a feature class inside a feature dataset.
 - [Attribute domains overview](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/overview/an-overview-of-attribute-domains.html): coded value domains "specify a valid set of values for an attribute", and subtypes can each have different domains. The page does not say whether stored values are checked.
 
-Real runs, on ArcGIS Pro 3.6 against a synthetic file geodatabase: the dataset scan with tokens, with `--check-domains`, with both, with `--max-placeholder-pct` passing and refusing, a feature class in a feature dataset, and a `.dbf` with declared tokens. The stand-in arcpy covers the remaining paths and the project scan.
+Real runs, on ArcGIS Pro 3.6 against synthetic data: the dataset scan with tokens, with `--check-domains`, with both, with `--max-placeholder-pct` passing and refusing, a feature class in a feature dataset, a `.dbf` with declared tokens, a Single field holding `-9999.9`, a table with a Blob column, `--max-null-pct` typed in another case and on a `NOT NULL` number, a 250-row decimal-limit boundary, and a saved project with a join, a typo in a declared field and a moved geodatabase. The stand-in arcpy covers the remaining paths, including exit `4` for a single dataset.
 
 ## Contributing
 
